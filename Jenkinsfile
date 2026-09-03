@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        // Tools on macOS
+        // macOS Homebrew tools
         PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${env.PATH}"
 
         // AWS / EKS
@@ -20,6 +20,12 @@ pipeline {
             steps {
                 echo 'Checking out CD repository...'
                 checkout scm
+
+                sh '''
+                    echo "========== REPOSITORY FILES =========="
+                    pwd
+                    ls -la
+                '''
             }
         }
 
@@ -43,156 +49,158 @@ pipeline {
             }
         }
 
-        stage('3. AWS Authentication') {
+        stage('3. Deploy to AWS EKS') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'aws-credentials',
-                        usernameVariable: 'AWS_ACCESS_KEY_ID',
-                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )
-                ]) {
-                    sh '''
-                        echo "========== AWS AUTHENTICATION =========="
 
-                        aws sts get-caller-identity \
-                            --region $AWS_REGION
-                    '''
-                }
-            }
-        }
-
-        stage('4. Connect to EKS') {
-            steps {
                 withCredentials([
-                    usernamePassword(
-                        credentialsId: 'aws-credentials',
-                        usernameVariable: 'AWS_ACCESS_KEY_ID',
-                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-                    )
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials']
                 ]) {
+
                     sh '''
-                        echo "========== CONNECT TO EKS =========="
+                        set -e
+
+                        echo "========================================="
+                        echo "AWS AUTHENTICATION"
+                        echo "========================================="
+
+                        aws sts get-caller-identity
+
+                        echo ""
+                        echo "========================================="
+                        echo "CHECK EKS CLUSTER"
+                        echo "========================================="
+
+                        aws eks describe-cluster \
+                            --region "$AWS_REGION" \
+                            --name "$EKS_CLUSTER" \
+                            --query 'cluster.{Name:name,Status:status,Version:version}' \
+                            --output table
+
+                        echo ""
+                        echo "========================================="
+                        echo "CONNECT TO EKS"
+                        echo "========================================="
 
                         aws eks update-kubeconfig \
-                            --region $AWS_REGION \
-                            --name $EKS_CLUSTER
+                            --region "$AWS_REGION" \
+                            --name "$EKS_CLUSTER"
 
+                        echo ""
                         echo "Current Kubernetes context:"
                         kubectl config current-context
 
-                        echo "Checking worker nodes:"
-                        kubectl get nodes
+                        echo ""
+                        echo "Worker nodes:"
+                        kubectl get nodes -o wide
+
+                        echo ""
+                        echo "========================================="
+                        echo "CREATE NAMESPACE"
+                        echo "========================================="
+
+                        kubectl apply -f namespace.yaml
+
+                        echo ""
+                        echo "========================================="
+                        echo "APPLY CONFIGURATION"
+                        echo "========================================="
+
+                        kubectl apply -f configmap.yaml \
+                            -n "$NAMESPACE"
+
+                        kubectl apply -f secrets.yaml \
+                            -n "$NAMESPACE"
+
+                        kubectl apply -f serviceaccount.yaml \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "========================================="
+                        echo "DEPLOY APPLICATION"
+                        echo "========================================="
+
+                        kubectl apply -f deployment.yaml \
+                            -n "$NAMESPACE"
+
+                        kubectl apply -f service.yaml \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "========================================="
+                        echo "APPLY PRODUCTION RESOURCES"
+                        echo "========================================="
+
+                        kubectl apply -f hpa.yaml \
+                            -n "$NAMESPACE"
+
+                        kubectl apply -f pdb.yaml \
+                            -n "$NAMESPACE"
+
+                        kubectl apply -f networkpolicy.yaml \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "========================================="
+                        echo "APPLY INGRESS"
+                        echo "========================================="
+
+                        kubectl apply -f ingress.yaml \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "========================================="
+                        echo "WAIT FOR DEPLOYMENT"
+                        echo "========================================="
+
+                        kubectl rollout status \
+                            deployment/"$DEPLOYMENT_NAME" \
+                            -n "$NAMESPACE" \
+                            --timeout=300s
+
+                        echo ""
+                        echo "========================================="
+                        echo "VERIFY DEPLOYMENT"
+                        echo "========================================="
+
+                        echo ""
+                        echo "PODS:"
+                        kubectl get pods \
+                            -n "$NAMESPACE" \
+                            -o wide
+
+                        echo ""
+                        echo "DEPLOYMENTS:"
+                        kubectl get deployments \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "SERVICES:"
+                        kubectl get services \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "INGRESS:"
+                        kubectl get ingress \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "HPA:"
+                        kubectl get hpa \
+                            -n "$NAMESPACE"
+
+                        echo ""
+                        echo "========================================="
+                        echo "DEPLOYMENT COMPLETED"
+                        echo "========================================="
                     '''
                 }
-            }
-        }
-
-        stage('5. Create Namespace') {
-            steps {
-                sh '''
-                    echo "========== NAMESPACE =========="
-
-                    kubectl apply -f namespace.yaml
-                '''
-            }
-        }
-
-        stage('6. Apply Configuration') {
-            steps {
-                sh '''
-                    echo "========== CONFIGURATION =========="
-
-                    kubectl apply -f configmap.yaml \
-                        -n $NAMESPACE
-
-                    kubectl apply -f secrets.yaml \
-                        -n $NAMESPACE
-
-                    kubectl apply -f serviceaccount.yaml \
-                        -n $NAMESPACE
-                '''
-            }
-        }
-
-        stage('7. Deploy Application') {
-            steps {
-                sh '''
-                    echo "========== DEPLOY APPLICATION =========="
-
-                    kubectl apply -f deployment.yaml \
-                        -n $NAMESPACE
-
-                    kubectl apply -f service.yaml \
-                        -n $NAMESPACE
-                '''
-            }
-        }
-
-        stage('8. Apply Production Resources') {
-            steps {
-                sh '''
-                    echo "========== PRODUCTION RESOURCES =========="
-
-                    kubectl apply -f hpa.yaml \
-                        -n $NAMESPACE
-
-                    kubectl apply -f pdb.yaml \
-                        -n $NAMESPACE
-
-                    kubectl apply -f networkpolicy.yaml \
-                        -n $NAMESPACE
-                '''
-            }
-        }
-
-        stage('9. Apply Ingress') {
-            steps {
-                sh '''
-                    echo "========== INGRESS =========="
-
-                    kubectl apply -f ingress.yaml \
-                        -n $NAMESPACE
-                '''
-            }
-        }
-
-        stage('10. Verify Rollout') {
-            steps {
-                sh '''
-                    echo "========== VERIFY ROLLOUT =========="
-
-                    kubectl rollout status \
-                        deployment/$DEPLOYMENT_NAME \
-                        -n $NAMESPACE \
-                        --timeout=300s
-                '''
-            }
-        }
-
-        stage('11. Verify Deployment') {
-            steps {
-                sh '''
-                    echo "========== PODS =========="
-                    kubectl get pods -n $NAMESPACE -o wide
-
-                    echo "========== DEPLOYMENTS =========="
-                    kubectl get deployments -n $NAMESPACE
-
-                    echo "========== SERVICES =========="
-                    kubectl get services -n $NAMESPACE
-
-                    echo "========== INGRESS =========="
-                    kubectl get ingress -n $NAMESPACE
-
-                    echo "========== HPA =========="
-                    kubectl get hpa -n $NAMESPACE
-                '''
             }
         }
     }
 
     post {
+
         success {
             echo '========================================='
             echo 'DEPLOYMENT SUCCESSFUL'
@@ -203,7 +211,7 @@ pipeline {
         failure {
             echo '========================================='
             echo 'DEPLOYMENT FAILED'
-            echo 'Check the failed Jenkins stage above.'
+            echo 'Check the first error in the Jenkins console.'
             echo '========================================='
         }
 
