@@ -2,20 +2,23 @@ pipeline {
     agent any
 
     environment {
-        AWS_REGION = 'us-east-1'
+        // Tools on macOS
+        PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${env.PATH}"
 
-        // CHANGE THESE
-        AWS_ACCOUNT_ID = '473479140221'
-        ECR_REPOSITORY = 'restaurant-company'
-        EKS_CLUSTER_NAME = 'eks-rest'
+        // AWS / EKS
+        AWS_REGION = "us-east-1"
+        EKS_CLUSTER = "eks-rest"
 
-        IMAGE = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:latest"
+        // Kubernetes
+        NAMESPACE = "restaurant-company"
+        DEPLOYMENT_NAME = "restaurant-company"
     }
 
     stages {
 
-        stage('1. Checkout CD Repository') {
+        stage('1. Checkout') {
             steps {
+                echo 'Checking out CD repository...'
                 checkout scm
             }
         }
@@ -23,78 +26,167 @@ pipeline {
         stage('2. Verify Tools') {
             steps {
                 sh '''
-                    echo "Checking AWS CLI..."
+                    echo "========== VERIFY TOOLS =========="
+
+                    echo "AWS CLI:"
+                    which aws
                     aws --version
 
-                    echo "Checking kubectl..."
+                    echo "kubectl:"
+                    which kubectl
                     kubectl version --client
 
-                    echo "Checking deployment files..."
-                    ls -la
+                    echo "Git:"
+                    which git
+                    git --version
                 '''
             }
         }
 
-        stage('3. Connect to EKS') {
+        stage('3. AWS Authentication') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        echo "========== AWS AUTHENTICATION =========="
+
+                        aws sts get-caller-identity \
+                            --region $AWS_REGION
+                    '''
+                }
+            }
+        }
+
+        stage('4. Connect to EKS') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        echo "========== CONNECT TO EKS =========="
+
+                        aws eks update-kubeconfig \
+                            --region $AWS_REGION \
+                            --name $EKS_CLUSTER
+
+                        echo "Current Kubernetes context:"
+                        kubectl config current-context
+
+                        echo "Checking worker nodes:"
+                        kubectl get nodes
+                    '''
+                }
+            }
+        }
+
+        stage('5. Create Namespace') {
             steps {
                 sh '''
-                    echo "Connecting Jenkins to EKS..."
+                    echo "========== NAMESPACE =========="
 
-                    aws eks update-kubeconfig \
-                      --region ${AWS_REGION} \
-                      --name ${EKS_CLUSTER_NAME}
-
-                    echo "Testing Kubernetes connection..."
-                    kubectl get nodes
+                    kubectl apply -f namespace.yaml
                 '''
             }
         }
 
-        stage('4. Deploy Kubernetes Resources') {
+        stage('6. Apply Configuration') {
             steps {
                 sh '''
-                    echo "Creating/updating Kubernetes resources..."
+                    echo "========== CONFIGURATION =========="
 
-                    kubectl apply -f deployment.yaml
-                    kubectl apply -f service.yaml
+                    kubectl apply -f configmap.yaml \
+                        -n $NAMESPACE
+
+                    kubectl apply -f secrets.yaml \
+                        -n $NAMESPACE
+
+                    kubectl apply -f serviceaccount.yaml \
+                        -n $NAMESPACE
                 '''
             }
         }
 
-        stage('5. Update Application Image') {
+        stage('7. Deploy Application') {
             steps {
                 sh '''
-                    echo "Deploying image:"
-                    echo ${IMAGE}
+                    echo "========== DEPLOY APPLICATION =========="
 
-                    kubectl set image \
-                      deployment/restaurant-company \
-                      restaurant-company=${IMAGE}
+                    kubectl apply -f deployment.yaml \
+                        -n $NAMESPACE
+
+                    kubectl apply -f service.yaml \
+                        -n $NAMESPACE
                 '''
             }
         }
 
-        stage('6. Wait for Deployment') {
+        stage('8. Apply Production Resources') {
             steps {
                 sh '''
+                    echo "========== PRODUCTION RESOURCES =========="
+
+                    kubectl apply -f hpa.yaml \
+                        -n $NAMESPACE
+
+                    kubectl apply -f pdb.yaml \
+                        -n $NAMESPACE
+
+                    kubectl apply -f networkpolicy.yaml \
+                        -n $NAMESPACE
+                '''
+            }
+        }
+
+        stage('9. Apply Ingress') {
+            steps {
+                sh '''
+                    echo "========== INGRESS =========="
+
+                    kubectl apply -f ingress.yaml \
+                        -n $NAMESPACE
+                '''
+            }
+        }
+
+        stage('10. Verify Rollout') {
+            steps {
+                sh '''
+                    echo "========== VERIFY ROLLOUT =========="
+
                     kubectl rollout status \
-                      deployment/restaurant-company \
-                      --timeout=180s
+                        deployment/$DEPLOYMENT_NAME \
+                        -n $NAMESPACE \
+                        --timeout=300s
                 '''
             }
         }
 
-        stage('7. Verify Deployment') {
+        stage('11. Verify Deployment') {
             steps {
                 sh '''
                     echo "========== PODS =========="
-                    kubectl get pods -o wide
+                    kubectl get pods -n $NAMESPACE -o wide
 
-                    echo "========== DEPLOYMENT =========="
-                    kubectl get deployment restaurant-company
+                    echo "========== DEPLOYMENTS =========="
+                    kubectl get deployments -n $NAMESPACE
 
-                    echo "========== SERVICE =========="
-                    kubectl get service restaurant-company-service
+                    echo "========== SERVICES =========="
+                    kubectl get services -n $NAMESPACE
+
+                    echo "========== INGRESS =========="
+                    kubectl get ingress -n $NAMESPACE
+
+                    echo "========== HPA =========="
+                    kubectl get hpa -n $NAMESPACE
                 '''
             }
         }
@@ -102,21 +194,21 @@ pipeline {
 
     post {
         success {
-            echo '''
-==========================================
-RESTAURANT COMPANY CD PASSED
-Application deployed successfully to EKS
-==========================================
-'''
+            echo '========================================='
+            echo 'DEPLOYMENT SUCCESSFUL'
+            echo 'Restaurant Company deployed to AWS EKS.'
+            echo '========================================='
         }
 
         failure {
-            echo '''
-==========================================
-DEPLOYMENT FAILED
-Check Jenkins logs and Kubernetes events
-==========================================
-'''
+            echo '========================================='
+            echo 'DEPLOYMENT FAILED'
+            echo 'Check the failed Jenkins stage above.'
+            echo '========================================='
+        }
+
+        always {
+            echo 'Pipeline finished.'
         }
     }
 }
